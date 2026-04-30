@@ -25,15 +25,18 @@ import ansys.lumerical.core as lumapi
 # ── Configurable parameters ───────────────────────────────────────────────────
 
 SIMULATION_FILE = ""          # Path to .lms file; leave "" to use current session
-WAVELENGTH      = 1.55e-6     # Wavelength (m)
+WAVELENGTH      = 780e-9      # Wavelength (m)
 SIN_THICKNESS   = 200e-9      # Fixed SiN thickness (m) – used only for sanity checks
 RECT_NAME       = "rectangle" # Name of the SiN rectangle in the deck
 GLOBAL_MODE     = "global_mode1"  # Name of the reference mode dataset
 
 # Width sweep range
-WIDTH_MIN   = 0.3e-6   # m
-WIDTH_MAX   = 2.0e-6   # m
-N_COARSE    = 20       # Number of coarse sweep points
+WIDTH_MIN   = 10e-9    # m  – minimum fabricable feature size
+WIDTH_MAX   = 10e-6    # m  – upper bound (peak coupling expected well below this)
+N_COARSE    = 30       # Number of coarse sweep points (log-spaced, see below)
+
+# Multi-waveguide gap constraint (enforced when extending to multi-rect designs)
+MIN_GAP     = 10e-9    # m  – minimum edge-to-edge gap between SiN rectangles
 
 # FDE analysis settings
 N_TRIAL_MODES = 20
@@ -103,7 +106,8 @@ def optimise(session) -> tuple[float, float, list, list]:
     widths       : coarse-sweep width array
     couplings    : coarse-sweep coupling array
     """
-    widths    = np.linspace(WIDTH_MIN, WIDTH_MAX, N_COARSE)
+    # Log-spaced so the 10 nm–10 µm range is sampled evenly per decade
+    widths    = np.logspace(np.log10(WIDTH_MIN), np.log10(WIDTH_MAX), N_COARSE)
     couplings = np.empty(N_COARSE)
 
     print(f"\n{'Width (nm)':>12}  {'Coupling':>10}")
