@@ -53,8 +53,8 @@ ADAPT_REL_TOL  = 0.02   # 2 % of the observed coupling range
 ADAPT_MIN_WIDTH = 1e-9  # m  – stop subdividing below this interval width
 ADAPT_MAX_DEPTH = 6     # maximum recursion depth per interval
 
-# FDE analysis settings
-N_TRIAL_MODES = 20
+# FDE analysis settings – find 5 modes for the SiN waveguide, use only TE0
+N_TRIAL_MODES = 5
 
 # ── Core helpers ──────────────────────────────────────────────────────────────
 
@@ -80,32 +80,55 @@ def _find_modes(session) -> int:
     return n
 
 
-def _coupling_to_global(session, n_modes: int) -> float:
+def _find_te0(session, n_modes: int) -> int:
     """
-    Return the maximum power coupling coefficient between global_mode1 and
-    any mode found by the current FDE run.
-
-    Lumerical's overlap() function computes the bidirectional overlap integral:
-        η = |∫∫(E₁×H₂* + E₂×H₁*)·ẑ dA|² /
-            (4 · Re{∫∫(E₁×H₁*)·ẑ dA} · Re{∫∫(E₂×H₂*)·ẑ dA})
-    which equals the fraction of input power that couples into the target mode.
+    Return the 1-based index of TE0: the highest-neff mode with TE fraction > 0.5.
+    FDE sorts modes by decreasing neff, so the first TE mode encountered is TE0.
+    Returns 0 if no TE mode is found (waveguide below cut-off for TE).
     """
     script = f"""
-    _max_c = 0;
+    _te0_idx = 0;
     for (_i = 1; _i <= {n_modes}; _i = _i + 1) {{
-        _c = overlap("FDE::data::{GLOBAL_MODE}", "FDE::data::mode" + num2str(_i));
-        if (_c > _max_c) {{ _max_c = _c; }}
+        if (_te0_idx == 0) {{
+            _mname = "FDE::data::mode" + num2str(_i);
+            _te = getresult(_mname, "TE polarization fraction");
+            if (_te > 0.5) {{ _te0_idx = _i; }}
+        }}
     }}
     """
     session.eval(script)
-    return float(session.getv("_max_c"))
+    return int(session.getv("_te0_idx"))
+
+
+def _coupling_to_global(session, te0_idx: int) -> float:
+    """
+    Power coupling coefficient from global_mode1 into the SiN TE0 mode.
+
+    Uses copydcard to avoid mutating the original dataset, then shiftdcard to
+    align the global mode's y-centre with the SiN rectangle centre before
+    evaluating the bidirectional overlap integral:
+        η = |∫∫(E₁×H₂* + E₂×H₁*)·ẑ dA|² /
+            (4 · Re{∫∫(E₁×H₁*)·ẑ dA} · Re{∫∫(E₂×H₂*)·ẑ dA})
+    """
+    script = f"""
+    copydcard("FDE::data::{GLOBAL_MODE}", "working_global_mode");
+    _y_sin    = getnamed("{RECT_NAME}", "y");
+    _y_global = mean(getdata("working_global_mode", "y"));
+    shiftdcard("working_global_mode", 0, _y_sin - _y_global);
+    _coupling = overlap("working_global_mode", "FDE::data::mode{te0_idx}");
+    """
+    session.eval(script)
+    return float(session.getv("_coupling"))
 
 
 def compute_coupling(session, width: float) -> float:
-    """Set width, run FDE, return best coupling to global_mode1."""
+    """Set y span, find 5 modes, pick TE0, return aligned overlap with global_mode1."""
     _set_width(session, width)
-    n = _find_modes(session)
-    return _coupling_to_global(session, n)
+    n       = _find_modes(session)
+    te0_idx = _find_te0(session, n)
+    if te0_idx == 0:
+        return 0.0  # no TE mode supported at this width
+    return _coupling_to_global(session, te0_idx)
 
 
 # ── Adaptive refinement ───────────────────────────────────────────────────────
