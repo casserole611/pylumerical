@@ -3,9 +3,11 @@
 # Maximises power coupling from a pre-computed reference mode ("global_mode1")
 # into a SiN waveguide rectangle whose thickness is fixed at 200 nm.
 #
-# The script performs a two-stage search:
-#   1. Coarse sweep across a configurable width range.
-#   2. Bounded golden-section refinement around the best coarse point.
+# The script performs a three-stage search:
+#   1. Coarse log-spaced sweep across the full width range.
+#   2. Adaptive refinement: intervals where coupling changes steeply are
+#      recursively bisected (log-midpoint) until smooth or below min feature size.
+#   3. Bounded golden-section refinement around the global maximum.
 #
 # Prerequisites:
 #   - Valid MODE licence.
@@ -33,10 +35,18 @@ GLOBAL_MODE     = "global_mode1"  # Name of the reference mode dataset
 # Width sweep range
 WIDTH_MIN   = 10e-9    # m  – minimum fabricable feature size
 WIDTH_MAX   = 10e-6    # m  – upper bound (peak coupling expected well below this)
-N_COARSE    = 30       # Number of coarse sweep points (log-spaced, see below)
+N_COARSE    = 30       # Number of coarse sweep points (log-spaced)
 
 # Multi-waveguide gap constraint (enforced when extending to multi-rect designs)
 MIN_GAP     = 10e-9    # m  – minimum edge-to-edge gap between SiN rectangles
+
+# Adaptive refinement: after the coarse sweep, intervals where coupling changes
+# by more than ADAPT_REL_TOL * (max−min) are subdivided at their log-midpoint,
+# recursively, until the interval narrows to ADAPT_MIN_WIDTH or ADAPT_MAX_DEPTH
+# recursion levels are reached.
+ADAPT_REL_TOL  = 0.02   # 2 % of the observed coupling range
+ADAPT_MIN_WIDTH = 1e-9  # m  – stop subdividing below this interval width
+ADAPT_MAX_DEPTH = 6     # maximum recursion depth per interval
 
 # FDE analysis settings
 N_TRIAL_MODES = 20
@@ -93,6 +103,63 @@ def compute_coupling(session, width: float) -> float:
     return _coupling_to_global(session, n)
 
 
+# ── Adaptive refinement ───────────────────────────────────────────────────────
+
+def _refine_interval(
+    session,
+    w_lo: float, c_lo: float,
+    w_hi: float, c_hi: float,
+    depth: int,
+    coupling_range: float,
+) -> list[tuple[float, float]]:
+    """
+    Recursively insert (width, coupling) samples inside [w_lo, w_hi].
+
+    Returns a list of NEW interior points (not including the endpoints).
+    Subdivision stops when:
+      - the coupling change across the interval is within tolerance, OR
+      - the interval is narrower than ADAPT_MIN_WIDTH, OR
+      - the recursion depth exceeds ADAPT_MAX_DEPTH.
+    """
+    if depth >= ADAPT_MAX_DEPTH:
+        return []
+    if (w_hi - w_lo) <= ADAPT_MIN_WIDTH * 2:
+        return []
+    if abs(c_hi - c_lo) <= ADAPT_REL_TOL * coupling_range:
+        return []
+
+    w_mid = np.exp((np.log(w_lo) + np.log(w_hi)) / 2)
+    c_mid = compute_coupling(session, w_mid)
+    print(f"  [refine d={depth}] {w_mid * 1e9:9.2f} nm  →  {c_mid:.6f}")
+
+    left  = _refine_interval(session, w_lo, c_lo, w_mid, c_mid, depth + 1, coupling_range)
+    right = _refine_interval(session, w_mid, c_mid, w_hi, c_hi, depth + 1, coupling_range)
+    return left + [(w_mid, c_mid)] + right
+
+
+def _adaptive_refine(
+    session,
+    pts: list[tuple[float, float]],
+    coupling_range: float,
+) -> list[tuple[float, float]]:
+    """
+    Given a sorted list of (width, coupling) pairs, return a refined list
+    with extra samples inserted wherever the coupling landscape is steep.
+    """
+    refined = [pts[0]]
+    for i in range(len(pts) - 1):
+        interior = _refine_interval(
+            session,
+            pts[i][0], pts[i][1],
+            pts[i + 1][0], pts[i + 1][1],
+            depth=0,
+            coupling_range=coupling_range,
+        )
+        refined.extend(interior)
+        refined.append(pts[i + 1])
+    return refined
+
+
 # ── Optimisation ─────────────────────────────────────────────────────────────
 
 def optimise(session) -> tuple[float, float, list, list]:
@@ -103,26 +170,43 @@ def optimise(session) -> tuple[float, float, list, list]:
     -------
     best_width   : optimal SiN width (m)
     best_coupling: corresponding power coupling coefficient
-    widths       : coarse-sweep width array
-    couplings    : coarse-sweep coupling array
+    widths       : all sampled widths (coarse + adaptive), sorted
+    couplings    : corresponding coupling values
     """
-    # Log-spaced so the 10 nm–10 µm range is sampled evenly per decade
-    widths    = np.logspace(np.log10(WIDTH_MIN), np.log10(WIDTH_MAX), N_COARSE)
-    couplings = np.empty(N_COARSE)
+    # ── Stage 1: coarse log-spaced sweep ─────────────────────────────────────
+    coarse_w = np.logspace(np.log10(WIDTH_MIN), np.log10(WIDTH_MAX), N_COARSE)
 
-    print(f"\n{'Width (nm)':>12}  {'Coupling':>10}")
+    print(f"\n── Coarse sweep ({N_COARSE} points, log-spaced) ──")
+    print(f"{'Width (nm)':>12}  {'Coupling':>10}")
     print("─" * 26)
-    for idx, w in enumerate(widths):
+    pts: list[tuple[float, float]] = []
+    for w in coarse_w:
         c = compute_coupling(session, w)
-        couplings[idx] = c
+        pts.append((w, c))
         print(f"{w * 1e9:>12.1f}  {c:>10.6f}")
 
-    # Bracket around the coarse maximum
+    # ── Stage 2: adaptive refinement ─────────────────────────────────────────
+    c_vals = [p[1] for p in pts]
+    coupling_range = max(c_vals) - min(c_vals)
+
+    if coupling_range > 0:
+        print(
+            f"\n── Adaptive refinement "
+            f"(tol = {ADAPT_REL_TOL*100:.0f}% × range = {coupling_range * ADAPT_REL_TOL:.6f}) ──"
+        )
+        pts = _adaptive_refine(session, pts, coupling_range)
+    else:
+        print("\n  Coupling is flat across the sweep range – skipping adaptive refinement.")
+
+    widths    = [p[0] for p in pts]
+    couplings = [p[1] for p in pts]
+
+    # ── Stage 3: golden-section refinement around the global maximum ──────────
     best_idx = int(np.argmax(couplings))
     w_lo = widths[max(0, best_idx - 1)]
-    w_hi = widths[min(N_COARSE - 1, best_idx + 1)]
+    w_hi = widths[min(len(widths) - 1, best_idx + 1)]
 
-    print(f"\nFine search:  [{w_lo * 1e9:.1f} nm, {w_hi * 1e9:.1f} nm]")
+    print(f"\n── Fine search: [{w_lo * 1e9:.2f} nm, {w_hi * 1e9:.2f} nm] ──")
     result = minimize_scalar(
         lambda w: -compute_coupling(session, w),
         bounds=(w_lo, w_hi),
@@ -133,12 +217,13 @@ def optimise(session) -> tuple[float, float, list, list]:
     best_width    = float(result.x)
     best_coupling = float(-result.fun)
 
-    print(f"\n{'─'*40}")
+    print(f"\n{'─'*42}")
     print(f"  Optimal SiN width  : {best_width * 1e9:.2f} nm")
     print(f"  Max power coupling : {best_coupling:.6f}  ({best_coupling * 100:.2f} %)")
-    print(f"{'─'*40}\n")
+    print(f"  Total FDE runs     : {len(pts)}")
+    print(f"{'─'*42}\n")
 
-    return best_width, best_coupling, widths.tolist(), couplings.tolist()
+    return best_width, best_coupling, widths, couplings
 
 
 # ── Plotting ─────────────────────────────────────────────────────────────────
@@ -146,7 +231,7 @@ def optimise(session) -> tuple[float, float, list, list]:
 def plot_sweep(widths, couplings, best_width, best_coupling) -> None:
     """Plot coarse sweep with the optimal point highlighted."""
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(np.array(widths) * 1e9, couplings, "o-", lw=1.5, label="Coarse sweep")
+    ax.plot(np.array(widths) * 1e9, couplings, "o-", lw=1.5, label="All samples (coarse + adaptive)")
     ax.axvline(best_width * 1e9, color="red", ls="--", lw=1.2, label=f"Optimal: {best_width*1e9:.1f} nm")
     ax.scatter([best_width * 1e9], [best_coupling], color="red", zorder=5)
     ax.set_xlabel("SiN width (nm)")
