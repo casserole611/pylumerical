@@ -54,8 +54,8 @@ N_TRIAL_MODES = 20
 # ── Core helpers ──────────────────────────────────────────────────────────────
 
 def _set_width(session, width: float) -> None:
-    """Update the SiN rectangle width without touching other dimensions."""
-    session.setnamed(RECT_NAME, "x span", width)
+    """Update the SiN rectangle y span (width); x=propagation, z=thickness are untouched."""
+    session.setnamed(RECT_NAME, "y span", width)
 
 
 def _find_modes(session) -> int:
