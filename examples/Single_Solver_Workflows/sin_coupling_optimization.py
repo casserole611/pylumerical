@@ -28,13 +28,18 @@ import ansys.lumerical.core as lumapi
 
 SIMULATION_FILE = ""          # Path to .lms file; leave "" to use current session
 WAVELENGTH      = 780e-9      # Wavelength (m)
-SIN_THICKNESS   = 200e-9      # Fixed SiN thickness (m) – used only for sanity checks
+SIN_THICKNESS   = 200e-9      # Fixed z span of the SiN rectangle (m) – not modified
 RECT_NAME       = "rectangle" # Name of the SiN rectangle in the deck
 GLOBAL_MODE     = "global_mode1"  # Name of the reference mode dataset
 
-# Width sweep range
+# Pre-configured FDE region (not modified by this script – geometry is fixed in the deck)
+#   z span : set to cover the SiO2 cladding/substrate regions
+#   y span : 10 µm  ← hard upper bound for the waveguide width sweep below
+FDE_Y_SPAN  = 10e-6    # m  – FDE window y span; WIDTH_MAX must stay below this
+
+# y span sweep range (x = propagation direction, z = thickness – both untouched)
 WIDTH_MIN   = 10e-9    # m  – minimum fabricable feature size
-WIDTH_MAX   = 10e-6    # m  – upper bound (peak coupling expected well below this)
+WIDTH_MAX   = FDE_Y_SPAN   # m  – sweeps up to the FDE window edge; peak expected well below
 N_COARSE    = 30       # Number of coarse sweep points (log-spaced)
 
 # Multi-waveguide gap constraint (enforced when extending to multi-rect designs)
