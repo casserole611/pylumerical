@@ -1,0 +1,156 @@
+# ============================================================
+# Lumerical FDE: dispersion map for LiN waveguides
+# Sweeps (width, etch) on a LN wafer and extracts beta2 (and D)
+# at 780 nm for each geometry.
+#
+# Output: LN_dispersion_map_total<N>nm.dat
+#   Columns: etch_nm, width_nm, D_ps_nm_km, beta2_fs2_mm, neff, Aeff_um2
+#
+# Change total_thick to target a different wafer thickness.
+# ============================================================
+
+switchtolayout;
+
+# --- Fixed parameters ---
+total_thick    = 600e-9;
+sidewall_angle = 60;
+
+# --- Sweep grids ---
+etch_list  = [50, 100, 150, 200, 250, 300, 350, 400] * 1e-9;
+width_list = [600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600] * 1e-9;
+
+# --- Dispersion sweep settings ---
+lambda_center  = 780e-9;
+lambda_low     = 700e-9;
+lambda_high    = 900e-9;
+num_freq_pts   = 21;
+num_modes_find = 3;
+TE_threshold   = 0.9;
+
+f_start = c / lambda_high;
+f_stop  = c / lambda_low;
+
+n_etch = length(etch_list);
+n_wid  = length(width_list);
+total_nm_str = num2str(round(total_thick * 1e9));
+
+filename = "LN_dispersion_map_total" + total_nm_str + "nm.dat";
+write(filename, "etch_nm,width_nm,D_ps_nm_km,beta2_fs2_mm,neff,Aeff_um2");
+
+# --- Pre-compute constants used in every iteration ---
+two_pi_c  = 2 * pi * c;
+total_str = num2str(n_etch * n_wid);
+
+# --- One-time FDE analysis settings (invariant across all iterations) ---
+select("FDE");
+setanalysis("search",                       "near n");
+setanalysis("use max index",                1);
+setanalysis("detailed dispersion calculation", 1);
+setanalysis("start frequency",              f_start);
+setanalysis("stop frequency",               f_stop);
+setanalysis("number of points",             num_freq_pts);
+
+count = 0;
+
+for (e_idx = 1:n_etch) {
+    etch    = etch_list(e_idx);
+    etch_nm = round(etch * 1e9);
+    slab    = total_thick - etch;
+
+    # Slab geometry only changes with etch — update once per etch level
+    switchtolayout;
+    select("rectangle");
+    set("z",      slab / 2);
+    set("z span", slab);
+
+    for (w_idx = 1:n_wid) {
+        wid    = width_list(w_idx);
+        wid_nm = round(wid * 1e9);
+        count  = count + 1;
+
+        ?("=== " + num2str(count) + "/" + total_str +
+          ": etch=" + num2str(etch_nm) +
+          "nm, width=" + num2str(wid_nm) + "nm ===");
+
+        # Return to layout after the previous frequencysweep
+        switchtolayout;
+
+        select("straight");
+        set("z",           slab + etch / 2);
+        set("base height", etch);
+        set("base angle",  sidewall_angle);
+        set("base width",  wid);
+
+        # --- Find modes at centre wavelength ---
+        select("FDE");
+        set("wavelength",            lambda_center);
+        set("number of trial modes", num_modes_find);
+
+        findmodes;
+
+        # --- Identify TE0: highest n_eff with TE fraction > threshold ---
+        best_neff = 0;
+        best_mode = 0;
+        for (m = 1:num_modes_find) {
+            te_frac = getdata("FDE::data::mode" + num2str(m), "TE polarization fraction");
+            if (te_frac > TE_threshold) {
+                neff_val = real(getdata("FDE::data::mode" + num2str(m), "neff"));
+                if (neff_val > best_neff) {
+                    best_neff = neff_val;
+                    best_mode = m;
+                }
+            }
+        }
+
+        if (best_mode == 0) {
+            ?("  SKIP: no TE0 above threshold (likely below cutoff)");
+            write(filename, num2str(etch_nm) + "," + num2str(wid_nm) + ",NaN,NaN,NaN,NaN");
+        } else {
+            ?("  TE0 = mode" + num2str(best_mode) +
+              ", n_eff @ 780 nm = " + num2str(best_neff));
+
+            # --- Effective mode area at 780 nm ---
+            # A_eff = (integral |E|^2 dA)^2 / integral |E|^4 dA
+            mode_id = "FDE::data::mode" + num2str(best_mode);
+            Ex = pinch(getdata(mode_id, "Ex"));
+            Ey = pinch(getdata(mode_id, "Ey"));
+            Ez = pinch(getdata(mode_id, "Ez"));
+            y_coord = getdata(mode_id, "y");
+            z_coord = getdata(mode_id, "z");
+
+            E2       = abs(Ex)^2 + abs(Ey)^2 + abs(Ez)^2;
+            num_A    = integrate2(E2,    1:2, y_coord, z_coord)^2;
+            denom_A  = integrate2(E2^2,  1:2, y_coord, z_coord);
+            Aeff_um2 = num_A / denom_A * 1e12;
+            ?("  A_eff = " + num2str(Aeff_um2) + " um^2");
+
+            # --- Frequency sweep ---
+            selectmode(best_mode);
+            setanalysis("track selected mode", 1);
+            frequencysweep;
+
+            # --- Interpolate D and neff at lambda_center ---
+            D_sweep        = getdata("frequencysweep", "D");
+            f_D            = getdata("frequencysweep", "f_D");
+            neff_sweep     = real(getdata("frequencysweep", "neff"));
+            lambda_sweep_m = c / f_D;
+
+            D_at    = interp(D_sweep,    lambda_sweep_m, lambda_center);
+            neff_at = interp(neff_sweep, lambda_sweep_m, lambda_center);
+
+            # --- Convert to engineering units ---
+            D_ps         = D_at * 1e6;
+            beta2_SI     = -(lambda_center^2 / two_pi_c) * D_at;
+            beta2_fs2_mm = beta2_SI * 1e27;   # s^2/m -> fs^2/mm
+
+            ?("  D = " + num2str(D_ps) + " ps/nm/km, beta2 = " +
+              num2str(beta2_fs2_mm) + " fs^2/mm");
+
+            write(filename, num2str(etch_nm) + "," + num2str(wid_nm) + "," +
+                  num2str(D_ps) + "," + num2str(beta2_fs2_mm) + "," +
+                  num2str(neff_at) + "," + num2str(Aeff_um2));
+        }
+    }
+}
+
+?("=== Done. Saved: " + filename + " ===");
